@@ -8,9 +8,8 @@ from fastapi import (
     UploadFile,
     HTTPException,
     Form,
+    Response,
 )
-
-from fastapi.responses import FileResponse as FastAPIFileResponse
 
 from sqlalchemy.orm import Session
 
@@ -28,7 +27,11 @@ from app.services.activity import create_activity_log
 
 from app.schemas.file import FileResponse, FileRename
 
-from app.storage import save_file
+from app.services.s3 import (
+    upload_to_s3,
+    get_from_s3,
+    delete_from_s3,
+)
 
 from datetime import datetime
 
@@ -233,9 +236,13 @@ async def upload_file(
 
     if stored_object is None:
 
-        storage_path = save_file(
-            file_content,
-            file_hash,
+        # File content does not exist in S3 yet.
+        # Upload it and create a new StoredObject.
+
+        storage_path = upload_to_s3(
+            file_content=file_content,
+            file_hash=file_hash,
+            content_type=file.content_type,
         )
 
         stored_object = StoredObject(
@@ -248,6 +255,15 @@ async def upload_file(
 
         db.flush()
 
+    else:
+
+    # Same file content already exists.
+    # Reuse the existing StoredObject.
+    #
+    # We do NOT upload the file again.
+    # We do NOT create another StoredObject.
+
+        pass
 
     # ========================================================
     # 10. CHECK DUPLICATE FILE IN SAME FOLDER
@@ -510,30 +526,24 @@ def download_file(
 
 
     # ========================================================
-    # 4. PHYSICAL FILE
+    # 4. GET FILE FROM S3
     # ========================================================
 
-    storage_path = Path(
-        stored_object.storage_path
+    file_content = get_from_s3(
+    	stored_object.storage_path
     )
-
-
-    if not storage_path.exists():
-
-        raise HTTPException(
-            status_code=404,
-            detail="Physical file not found",
-        )
 
 
     # ========================================================
     # 5. RETURN FILE
     # ========================================================
 
-    return FastAPIFileResponse(
-        path=str(storage_path),
-
-        filename=file.name,
+    return Response(
+        content=file_content,
+        media_type="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{file.name}"'
+        }
     )
 
 # ============================================================
@@ -581,13 +591,10 @@ def preview_file(
             detail="Stored object not found"
         )
 
-    file_path = Path(stored_object.storage_path)
+    file_content = get_from_s3(
+    	stored_object.storage_path
+    )
 
-    if not file_path.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="Physical file not found"
-        )
 
     extension = file.name.lower().split(".")[-1]
 
@@ -613,13 +620,13 @@ def preview_file(
         "application/octet-stream"
     )
 
-    return FastAPIFileResponse(
-    path=file_path,
-    media_type=media_type,
-    headers={
-        "Content-Disposition": "inline"
-    }
-)
+    return Response(
+        content=file_content,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": "inline"
+        }
+    )
 # ============================================================
 # SOFT DELETE FILE
 # ============================================================
@@ -789,12 +796,9 @@ def permanently_delete_file(
 
         if remaining_files == 0:
 
-            storage_path = Path(
-                stored_object.storage_path
-            )
-
-            if storage_path.exists():
-                storage_path.unlink()
+            delete_from_s3(
+            stored_object.storage_path
+        )
 
             db.delete(stored_object)
 
